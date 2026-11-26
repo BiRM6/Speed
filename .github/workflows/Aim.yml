@@ -1,0 +1,572 @@
+name: Build Ashveil Ghost Aimbot (Zero-Patch Zygisk)
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate Ghost Aimbot Project Files
+        run: |
+          mkdir -p native/src module
+
+          cat << '__END_MAIN_CPP__' > native/src/main.cpp
+          #include <android/log.h>
+          #include <atomic>
+          #include <cmath>
+          #include <cstdint>
+          #include <cstdio>
+          #include <cstdlib>
+          #include <cstring>
+          #include <dlfcn.h>
+          #include <memory>
+          #include <mutex>
+          #include <string>
+          #include <sys/prctl.h>
+          #include <sys/stat.h>
+          #include <thread>
+          #include <time.h>
+          #include <unistd.h>
+
+          #include "xhook.h"
+          #include "zygisk.hpp"
+
+          #define LOG_TAG "AshveilGhostAim"
+          #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
+          #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
+
+          static constexpr const char *kTargetPkg = "com.ashveilonline.game";
+
+          struct C3_POS {
+              int32_t x;
+              int32_t y;
+          };
+
+          // Opaque forward declarations for ABI-matching NDK libc++ calls
+          struct CHero;
+          struct CPlayer;
+          struct CRole;
+          struct CGamePlayerSet;
+
+          using FnGetPlayerByIndex = std::shared_ptr<CPlayer> (*)(const CGamePlayerSet *, uint32_t);
+          using FnGetPos           = void (*)(const CRole *, C3_POS &);
+          using FnIsJumping        = bool (*)(const CRole *);
+          using FnGetActionTarget  = C3_POS (*)(const CRole *);
+          using FnIsMonster        = bool (*)(const CRole *);
+          using FnGetCurLife       = int (*)(CPlayer *);
+          using FnIsEnemy          = bool (*)(CHero *, std::shared_ptr<CPlayer>);
+          using FnMagicAttackPos   = void (*)(CHero *, uint32_t, C3_POS, bool);
+          using FnGetDefaultMagic  = uint32_t (*)(CHero *);
+
+          struct GameApi {
+              bool resolved = false;
+              void *lib_handle = nullptr;
+
+              CHero **hero_instance_ptr = nullptr;
+              CGamePlayerSet **player_set_ptr = nullptr;
+
+              FnGetPlayerByIndex get_player_by_index = nullptr;
+              FnGetPos           get_pos             = nullptr;
+              FnIsJumping        is_jumping          = nullptr;
+              FnGetActionTarget  get_action_target   = nullptr;
+              FnIsMonster        is_monster          = nullptr;
+              FnGetCurLife       get_cur_life        = nullptr;
+              FnIsEnemy          is_enemy            = nullptr;
+              FnMagicAttackPos   magic_attack_pos    = nullptr;
+              FnGetDefaultMagic  get_default_magic   = nullptr;
+          };
+
+          static GameApi g_api;
+          static std::mutex g_api_mtx;
+
+          struct AimCommand {
+              uint64_t seq = 0;
+              uint32_t magic_id = 0;   // 0 = auto default magic, 1045 = FB, 1046 = SS, 9999 = scan only
+              int mode = 1;            // 1 = Players only (PvP), 2 = Monsters only (PvE), 3 = All
+              int max_dist = 14;       // tiles
+              int predict_jump = 1;    // 1 = aim at jump landing pos
+          };
+
+          static std::mutex g_cmd_mtx;
+          static AimCommand g_pending_cmd;
+          static uint64_t g_last_exec_seq = 0;
+          static std::atomic<bool> g_has_pending{false};
+          static std::atomic<bool> g_worker_started{false};
+
+          static std::string g_cmd_path;
+          static std::string g_status_path;
+
+          static std::string findLibPathInMaps(const char *lib_name) {
+              FILE *fp = fopen("/proc/self/maps", "r");
+              if (!fp) return "";
+              char line[512];
+              std::string found;
+              while (fgets(line, sizeof(line), fp) != nullptr) {
+                  if (strstr(line, lib_name) != nullptr) {
+                      char *p = strchr(line, '/');
+                      if (p) {
+                          found = p;
+                          while (!found.empty() && (found.back() == '\n' || found.back() == '\r')) {
+                              found.pop_back();
+                          }
+                          break;
+                      }
+                  }
+              }
+              fclose(fp);
+              return found;
+          }
+
+          static void writeStatus(const char *msg) {
+              if (g_status_path.empty()) return;
+              FILE *fp = fopen(g_status_path.c_str(), "w");
+              if (fp) {
+                  fprintf(fp, "%s\n", msg);
+                  fclose(fp);
+                  chmod(g_status_path.c_str(), 0666);
+              }
+          }
+
+          static bool resolveGameSymbols() {
+              std::lock_guard<std::mutex> lock(g_api_mtx);
+              if (g_api.resolved) return true;
+
+              std::string lib_path = findLibPathInMaps("libCQ2ClientEn.so");
+              if (lib_path.empty()) {
+                  return false;
+              }
+
+              void *h = dlopen(lib_path.c_str(), RTLD_NOLOAD | RTLD_NOW);
+              if (!h) {
+                  h = dlopen("libCQ2ClientEn.so", RTLD_NOLOAD | RTLD_NOW);
+              }
+              if (!h) {
+                  LOGE("dlopen NOLOAD failed: %s", dlerror());
+                  return false;
+              }
+
+              g_api.lib_handle = h;
+              g_api.hero_instance_ptr = reinterpret_cast<CHero **>(
+                  dlsym(h, "_ZN4Loki15SingletonHolderI5CHeroNS_14CreateUsingNewENS_15DefaultLifetimeENS_14SingleThreadedENS_5MutexEE10pInstance_E"));
+              g_api.player_set_ptr = reinterpret_cast<CGamePlayerSet **>(
+                  dlsym(h, "_ZZN9SingletonI14CGamePlayerSetE11GetInnerPtrEvE8innerPtr"));
+
+              g_api.get_player_by_index = reinterpret_cast<FnGetPlayerByIndex>(
+                  dlsym(h, "_ZNK14CGamePlayerSet16GetPlayerByIndexEj"));
+              g_api.get_pos = reinterpret_cast<FnGetPos>(
+                  dlsym(h, "_ZNK5CRole6GetPosER6C3_POS"));
+              g_api.is_jumping = reinterpret_cast<FnIsJumping>(
+                  dlsym(h, "_ZNK5CRole9IsJumpingEv"));
+              g_api.get_action_target = reinterpret_cast<FnGetActionTarget>(
+                  dlsym(h, "_ZNK5CRole18GetActionTargetPosEv"));
+              g_api.is_monster = reinterpret_cast<FnIsMonster>(
+                  dlsym(h, "_ZNK5CRole9IsMonsterEv"));
+              g_api.get_cur_life = reinterpret_cast<FnGetCurLife>(
+                  dlsym(h, "_ZN7CPlayer10GetCurLifeEv"));
+              g_api.is_enemy = reinterpret_cast<FnIsEnemy>(
+                  dlsym(h, "_ZN5CHero7IsEnemyENSt6__ndk110shared_ptrI7CPlayerEE"));
+              g_api.magic_attack_pos = reinterpret_cast<FnMagicAttackPos>(
+                  dlsym(h, "_ZN5CHero11MagicAttackEj6C3_POSb"));
+              g_api.get_default_magic = reinterpret_cast<FnGetDefaultMagic>(
+                  dlsym(h, "_ZN5CHero20GetDefaultClickMagicEv"));
+
+              bool ok = (g_api.hero_instance_ptr &&
+                         g_api.player_set_ptr &&
+                         g_api.get_player_by_index &&
+                         g_api.get_pos &&
+                         g_api.magic_attack_pos);
+
+              if (ok) {
+                  g_api.resolved = true;
+                  LOGI("All core GhostAim symbols resolved successfully!");
+                  writeStatus("READY|Ghost Engine Active");
+              } else {
+                  char buf[256];
+                  snprintf(buf, sizeof(buf), "ERR|h=%d ps=%d idx=%d pos=%d atk=%d",
+                           g_api.hero_instance_ptr != nullptr,
+                           g_api.player_set_ptr != nullptr,
+                           g_api.get_player_by_index != nullptr,
+                           g_api.get_pos != nullptr,
+                           g_api.magic_attack_pos != nullptr);
+                  LOGE("%s", buf);
+                  writeStatus(buf);
+              }
+              return ok;
+          }
+
+          static inline bool isGameMainThread() {
+              char tname[32] = {0};
+              prctl(PR_GET_NAME, tname, 0, 0, 0);
+              return (strncmp(tname, "GLThread", 8) == 0);
+          }
+
+          static void executeGhostAimOnMainThread(const AimCommand &cmd) {
+              if (!g_api.resolved) {
+                  if (!resolveGameSymbols()) return;
+              }
+
+              CHero *hero = (g_api.hero_instance_ptr) ? *(g_api.hero_instance_ptr) : nullptr;
+              CGamePlayerSet *pset = (g_api.player_set_ptr) ? *(g_api.player_set_ptr) : nullptr;
+
+              if (!hero || !pset) {
+                  writeStatus("WAIT|Enter game world first");
+                  return;
+              }
+
+              C3_POS hero_pos{0, 0};
+              g_api.get_pos(reinterpret_cast<const CRole *>(hero), hero_pos);
+
+              bool found = false;
+              int best_dist = 999999;
+              C3_POS best_pos{0, 0};
+              bool best_jumping = false;
+              int scanned_valid = 0;
+
+              for (uint32_t i = 0; i < 96; ++i) {
+                  std::shared_ptr<CPlayer> sp = g_api.get_player_by_index(pset, i);
+                  CPlayer *p = sp.get();
+                  if (!p) break;
+
+                  if (reinterpret_cast<void *>(p) == reinterpret_cast<void *>(hero)) {
+                      continue;
+                  }
+
+                  const CRole *role = reinterpret_cast<const CRole *>(p);
+
+                  if (g_api.get_cur_life) {
+                      int hp = g_api.get_cur_life(p);
+                      if (hp <= 0) continue;
+                  }
+
+                  bool is_mob = g_api.is_monster ? g_api.is_monster(role) : false;
+                  if (cmd.mode == 1 && is_mob) continue;       // PvP only
+                  if (cmd.mode == 2 && !is_mob) continue;      // PvE only
+
+                  if (g_api.is_enemy) {
+                      if (!g_api.is_enemy(hero, sp)) continue;
+                  }
+
+                  C3_POS tpos{0, 0};
+                  bool jumping = false;
+                  if (cmd.predict_jump && g_api.is_jumping && g_api.get_action_target) {
+                      jumping = g_api.is_jumping(role);
+                      if (jumping) {
+                          tpos = g_api.get_action_target(role);
+                      } else {
+                          g_api.get_pos(role, tpos);
+                      }
+                  } else {
+                      g_api.get_pos(role, tpos);
+                  }
+
+                  if (tpos.x <= 0 || tpos.y <= 0) continue;
+
+                  int dx = std::abs(tpos.x - hero_pos.x);
+                  int dy = std::abs(tpos.y - hero_pos.y);
+                  int dist = (dx > dy) ? dx : dy;
+
+                  scanned_valid++;
+                  if (dist <= cmd.max_dist && dist < best_dist) {
+                      best_dist = dist;
+                      best_pos = tpos;
+                      best_jumping = jumping;
+                      found = true;
+                  }
+              }
+
+              char st[192];
+              if (cmd.magic_id == 9999) {
+                  // Scan/Diagnostic mode only (does not fire)
+                  if (found) {
+                      snprintf(st, sizeof(st), "SCAN|Hero(%d,%d) Target(%d,%d) D=%d %s | N=%d",
+                               hero_pos.x, hero_pos.y, best_pos.x, best_pos.y, best_dist,
+                               best_jumping ? "JUMP" : "STAND", scanned_valid);
+                  } else {
+                      snprintf(st, sizeof(st), "SCAN|Hero(%d,%d) No target in %d | N=%d",
+                               hero_pos.x, hero_pos.y, cmd.max_dist, scanned_valid);
+                  }
+                  writeStatus(st);
+                  return;
+              }
+
+              if (!found) {
+                  snprintf(st, sizeof(st), "MISS|No enemy in %d tiles (N=%d)", cmd.max_dist, scanned_valid);
+                  writeStatus(st);
+                  return;
+              }
+
+              uint32_t skill = cmd.magic_id;
+              if (skill == 0 && g_api.get_default_magic) {
+                  skill = g_api.get_default_magic(hero);
+              }
+              if (skill == 0) {
+                  skill = 1045; // Fast Blade fallback
+              }
+
+              g_api.magic_attack_pos(hero, skill, best_pos, true);
+              snprintf(st, sizeof(st), "HIT|Skill=%u -> (%d,%d) D=%d %s",
+                       skill, best_pos.x, best_pos.y, best_dist,
+                       best_jumping ? "[PRED]" : "");
+              writeStatus(st);
+          }
+
+          static int hooked_clock_gettime(clockid_t clk_id, struct timespec *tp) {
+              if (g_has_pending.load(std::memory_order_acquire) && isGameMainThread()) {
+                  AimCommand cmd;
+                  bool should_run = false;
+                  {
+                      std::lock_guard<std::mutex> lock(g_cmd_mtx);
+                      if (g_pending_cmd.seq > g_last_exec_seq) {
+                          cmd = g_pending_cmd;
+                          g_last_exec_seq = cmd.seq;
+                          g_has_pending.store(false, std::memory_order_release);
+                          should_run = true;
+                      }
+                  }
+                  if (should_run) {
+                      executeGhostAimOnMainThread(cmd);
+                  }
+              }
+              return clock_gettime(clk_id, tp);
+          }
+
+          static void applyPltHook() {
+              xhook_enable_debug(0);
+              xhook_register("^/data/app/.*libCQ2ClientEn\\.so$", "clock_gettime",
+                             reinterpret_cast<void *>(hooked_clock_gettime), nullptr);
+              xhook_refresh(0);
+          }
+
+          static void readCmdFile(time_t &last_mtime) {
+              struct stat st{};
+              if (stat(g_cmd_path.c_str(), &st) != 0) return;
+              if (st.st_mtime == last_mtime) return;
+              last_mtime = st.st_mtime;
+
+              FILE *fp = fopen(g_cmd_path.c_str(), "r");
+              if (!fp) return;
+              char buf[128] = {0};
+              if (fgets(buf, sizeof(buf) - 1, fp) != nullptr) {
+                  unsigned long long seq = 0;
+                  unsigned int magic_id = 0;
+                  int mode = 1, max_dist = 14, pred = 1;
+                  if (sscanf(buf, "%llu %u %d %d %d", &seq, &magic_id, &mode, &max_dist, &pred) >= 2) {
+                      std::lock_guard<std::mutex> lock(g_cmd_mtx);
+                      if (seq > g_last_exec_seq) {
+                          g_pending_cmd.seq = static_cast<uint64_t>(seq);
+                          g_pending_cmd.magic_id = magic_id;
+                          g_pending_cmd.mode = mode;
+                          g_pending_cmd.max_dist = max_dist;
+                          g_pending_cmd.predict_jump = pred;
+                          g_has_pending.store(true, std::memory_order_release);
+                      }
+                  }
+              }
+              fclose(fp);
+          }
+
+          static void workerLoop() {
+              time_t last_mtime = 0;
+              static const int kRefreshSec[] = {2, 5, 10, 18};
+              size_t ridx = 0;
+              int ticks = 0;
+
+              writeStatus("INIT|Waiting for libCQ2ClientEn.so");
+
+              while (true) {
+                  usleep(20000); // 20ms responsive polling
+                  ticks++;
+
+                  if (ticks % 50 == 0 && ridx < (sizeof(kRefreshSec) / sizeof(kRefreshSec[0]))) {
+                      if ((ticks / 50) >= kRefreshSec[ridx]) {
+                          applyPltHook();
+                          if (!g_api.resolved) {
+                              resolveGameSymbols();
+                          }
+                          ridx++;
+                      }
+                  }
+
+                  readCmdFile(last_mtime);
+              }
+          }
+
+          class AshveilGhostAimModule : public zygisk::ModuleBase {
+          public:
+              void onLoad(zygisk::Api *api, JNIEnv *env) override {
+                  this->api_ = api;
+                  this->env_ = env;
+              }
+
+              void preAppSpecialize(zygisk::AppSpecializeArgs *args) override {
+                  if (!args || !args->nice_name) {
+                      api_->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
+                      return;
+                  }
+
+                  const char *raw_name = env_->GetStringUTFChars(args->nice_name, nullptr);
+                  std::string proc_name = raw_name ? raw_name : "";
+                  if (raw_name) env_->ReleaseStringUTFChars(args->nice_name, raw_name);
+
+                  if (proc_name == kTargetPkg) {
+                      is_target_ = true;
+                      if (args->app_data_dir) {
+                          const char *raw_dir = env_->GetStringUTFChars(args->app_data_dir, nullptr);
+                          if (raw_dir) {
+                              data_dir_ = raw_dir;
+                              env_->ReleaseStringUTFChars(args->app_data_dir, raw_dir);
+                          }
+                      }
+                      api_->setOption(zygisk::Option::FORCE_DENYLIST_UNMOUNT);
+                  } else {
+                      api_->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
+                  }
+              }
+
+              void postAppSpecialize(const zygisk::AppSpecializeArgs *args) override {
+                  (void)args;
+                  if (!is_target_) return;
+
+                  bool expected = false;
+                  if (g_worker_started.compare_exchange_strong(expected, true)) {
+                      std::string base = data_dir_.empty() ? "/data/local/tmp" : (data_dir_ + "/cache");
+                      g_cmd_path = base + "/.aim_cmd";
+                      g_status_path = base + "/.aim_status";
+                      LOGI("GhostAim active! cmd=%s", g_cmd_path.c_str());
+                      std::thread(workerLoop).detach();
+                  }
+              }
+
+              void preServerSpecialize(zygisk::ServerSpecializeArgs *args) override {
+                  (void)args;
+                  api_->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
+              }
+
+          private:
+              zygisk::Api *api_ = nullptr;
+              JNIEnv *env_ = nullptr;
+              bool is_target_ = false;
+              std::string data_dir_;
+          };
+
+          REGISTER_ZYGISK_MODULE(AshveilGhostAimModule)
+          __END_MAIN_CPP__
+
+          cat << '__END_CMAKE__' > native/CMakeLists.txt
+          cmake_minimum_required(VERSION 3.18)
+          project(ashevill_aim LANGUAGES C CXX)
+
+          set(CMAKE_CXX_STANDARD 17)
+          set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+          set(XHOOK_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/xHook/libxhook/jni")
+
+          add_library(xhook_static STATIC
+              "${XHOOK_DIR}/xhook.c"
+              "${XHOOK_DIR}/xh_core.c"
+              "${XHOOK_DIR}/xh_elf.c"
+              "${XHOOK_DIR}/xh_log.c"
+              "${XHOOK_DIR}/xh_util.c"
+              "${XHOOK_DIR}/xh_version.c"
+          )
+          target_include_directories(xhook_static PUBLIC "${XHOOK_DIR}")
+          target_compile_definitions(xhook_static PRIVATE PAGE_SIZE=4096 "PAGE_MASK=(~(4096UL-1))")
+          target_compile_options(xhook_static PRIVATE -O2 -fPIC -Wall -Wno-unused-parameter -Wno-sign-compare)
+
+          add_library(ashevill_aim SHARED
+              src/main.cpp
+          )
+          target_include_directories(ashevill_aim PRIVATE
+              "${CMAKE_CURRENT_SOURCE_DIR}/src"
+          )
+          target_compile_options(ashevill_aim PRIVATE
+              -O2 -fvisibility=hidden -fvisibility-inlines-hidden -fno-exceptions -fno-rtti
+          )
+          target_link_options(ashevill_aim PRIVATE
+              -Wl,--gc-sections -Wl,--exclude-libs,ALL
+          )
+          target_link_libraries(ashevill_aim PRIVATE
+              xhook_static
+              log
+              dl
+          )
+          __END_CMAKE__
+
+          cat << '__END_MOD_PROP__' > module/module.prop
+          id=ashevill_aim
+          name=Ashveil Ghost Aimbot (Zero-Patch Zygisk)
+          version=v1.0
+          versionCode=100
+          author=AshveilAim Project
+          description=Standalone Zero-Patch Zygisk Native Aimbot for Ashveil Online (FB/SS + Jump Predict)
+          __END_MOD_PROP__
+
+          cat << '__END_CUSTOMIZE__' > module/customize.sh
+          #!/system/bin/sh
+          ui_print "========================================="
+          ui_print "  Ashveil Ghost Aimbot (Zero-Patch v1.0) "
+          ui_print "========================================="
+          set_perm_recursive "$MODPATH" 0 0 0755 0644
+          ui_print "- Done! Reboot your device."
+          __END_CUSTOMIZE__
+
+      - name: Download official Zygisk API v4 header
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/topjohnwu/zygisk-module-sample/master/module/jni/zygisk.hpp \
+            -o native/src/zygisk.hpp
+
+      - name: Clone iqiyi/xHook
+        run: |
+          mkdir -p native/third_party
+          git clone --depth 1 https://github.com/iqiyi/xHook.git native/third_party/xHook
+
+      - name: Locate Android NDK
+        id: ndk
+        run: |
+          NDK_PATH="${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_HOME}}"
+          if [ -z "$NDK_PATH" ]; then
+            NDK_PATH=$(ls -d /usr/local/lib/android/sdk/ndk/* | sort -V | tail -n 1)
+          fi
+          echo "Using NDK: $NDK_PATH"
+          echo "path=$NDK_PATH" >> "$GITHUB_OUTPUT"
+
+      - name: Build ARM64 Native Library
+        run: |
+          NDK="${{ steps.ndk.outputs.path }}"
+          cmake -S native -B build/arm64-v8a \
+            -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM=android-24 \
+            -DANDROID_STL=c++_static \
+            -DCMAKE_BUILD_TYPE=Release
+          cmake --build build/arm64-v8a --parallel
+
+      - name: Package Flashable Magisk Module ZIP
+        run: |
+          mkdir -p out/zygisk
+          cp -r module/* out/
+          cp build/arm64-v8a/libashevill_aim.so out/zygisk/arm64-v8a.so
+          cd out
+          zip -r9 ../AshveilGhostAim-Magisk.zip .
+
+      - name: Upload Magisk Module Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AshveilGhostAim-Magisk
+          path: AshveilGhostAim-Magisk.zip
+
+      - name: Publish Direct Download Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="aim-v1.0-${GITHUB_RUN_NUMBER}"
+          gh release create "$TAG" AshveilGhostAim-Magisk.zip \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "Ashveil Ghost Aimbot ($TAG)" \
+            --notes "Standalone Zero-Patch Zygisk Aimbot module (arm64-v8a)." || true
