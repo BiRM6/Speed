@@ -1,0 +1,495 @@
+name: Build Ashveil Speed Magisk Module
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate Project Files
+        run: |
+          mkdir -p native/src module
+
+          cat << '__END_MAIN_CPP__' > native/src/main.cpp
+          #include <android/log.h>
+          #include <atomic>
+          #include <cerrno>
+          #include <cstdint>
+          #include <cstdio>
+          #include <cstdlib>
+          #include <cstring>
+          #include <mutex>
+          #include <string>
+          #include <sys/stat.h>
+          #include <sys/time.h>
+          #include <thread>
+          #include <time.h>
+          #include <unistd.h>
+
+          #include "xhook.h"
+          #include "zygisk.hpp"
+
+          #define LOG_TAG "AshveilSpeed"
+          #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
+          #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
+
+          static constexpr const char *kTargetFile = "/data/adb/modules/ashevill_speed/target.txt";
+          static constexpr int kMaxClocks = 16;
+
+          struct ClockState {
+              std::mutex mtx;
+              bool initialized = false;
+              int64_t last_real = 0;
+              int64_t virt_val = 0;
+          };
+
+          static ClockState g_clocks[kMaxClocks];
+          static ClockState g_gtod_state;
+
+          static std::atomic<double> g_speed{1.0};
+          static std::atomic<bool> g_hook_gtod{true};
+          static std::atomic<bool> g_worker_started{false};
+
+          static inline bool isGameMonotonicClock(clockid_t clk_id) {
+              switch (clk_id) {
+                  case CLOCK_MONOTONIC:
+                  case CLOCK_MONOTONIC_RAW:
+                  case CLOCK_MONOTONIC_COARSE:
+                  case CLOCK_BOOTTIME:
+                      return true;
+                  default:
+                      return false;
+              }
+          }
+
+          static int hooked_clock_gettime(clockid_t clk_id, struct timespec *tp) {
+              int ret = clock_gettime(clk_id, tp);
+              if (ret != 0 || tp == nullptr) {
+                  return ret;
+              }
+              if (!isGameMonotonicClock(clk_id)) {
+                  return ret;
+              }
+
+              int idx = static_cast<int>(clk_id);
+              if (idx < 0 || idx >= kMaxClocks) {
+                  return ret;
+              }
+
+              double mult = g_speed.load(std::memory_order_relaxed);
+              int64_t real_ns = static_cast<int64_t>(tp->tv_sec) * 1000000000LL + static_cast<int64_t>(tp->tv_nsec);
+
+              ClockState &st = g_clocks[idx];
+              std::lock_guard<std::mutex> lock(st.mtx);
+              if (!st.initialized) {
+                  st.initialized = true;
+                  st.last_real = real_ns;
+                  st.virt_val = real_ns;
+              } else {
+                  int64_t delta = real_ns - st.last_real;
+                  if (delta > 0) {
+                      st.virt_val += static_cast<int64_t>(static_cast<double>(delta) * mult);
+                      st.last_real = real_ns;
+                  }
+              }
+
+              tp->tv_sec = static_cast<time_t>(st.virt_val / 1000000000LL);
+              tp->tv_nsec = static_cast<long>(st.virt_val % 1000000000LL);
+              return ret;
+          }
+
+          static int hooked_gettimeofday(struct timeval *tv, struct timezone *tz) {
+              int ret = gettimeofday(tv, tz);
+              if (ret != 0 || tv == nullptr) {
+                  return ret;
+              }
+              if (!g_hook_gtod.load(std::memory_order_relaxed)) {
+                  return ret;
+              }
+
+              double mult = g_speed.load(std::memory_order_relaxed);
+              int64_t real_us = static_cast<int64_t>(tv->tv_sec) * 1000000LL + static_cast<int64_t>(tv->tv_usec);
+
+              std::lock_guard<std::mutex> lock(g_gtod_state.mtx);
+              if (!g_gtod_state.initialized) {
+                  g_gtod_state.initialized = true;
+                  g_gtod_state.last_real = real_us;
+                  g_gtod_state.virt_val = real_us;
+              } else {
+                  int64_t delta = real_us - g_gtod_state.last_real;
+                  if (delta > 0) {
+                      g_gtod_state.virt_val += static_cast<int64_t>(static_cast<double>(delta) * mult);
+                      g_gtod_state.last_real = real_us;
+                  }
+              }
+
+              tv->tv_sec = static_cast<time_t>(g_gtod_state.virt_val / 1000000LL);
+              tv->tv_usec = static_cast<suseconds_t>(g_gtod_state.virt_val % 1000000LL);
+              return ret;
+          }
+
+          static void readLiveConfig(const std::string &cfg_path, time_t &last_mtime) {
+              struct stat st{};
+              if (stat(cfg_path.c_str(), &st) != 0) {
+                  return;
+              }
+              if (st.st_mtime == last_mtime) {
+                  return;
+              }
+              last_mtime = st.st_mtime;
+
+              FILE *fp = fopen(cfg_path.c_str(), "r");
+              if (!fp) {
+                  return;
+              }
+              char buf[128] = {0};
+              if (fgets(buf, sizeof(buf) - 1, fp) != nullptr) {
+                  double spd = 1.0;
+                  int gtod_flag = 1;
+                  int n = sscanf(buf, "%lf %d", &spd, &gtod_flag);
+                  if (n >= 1) {
+                      if (spd < 0.5) spd = 0.5;
+                      if (spd > 4.0) spd = 4.0;
+                      g_speed.store(spd, std::memory_order_relaxed);
+                  }
+                  if (n >= 2) {
+                      g_hook_gtod.store(gtod_flag != 0, std::memory_order_relaxed);
+                  }
+                  LOGI("Updated speed=%.2fx gtod=%d", g_speed.load(), g_hook_gtod.load() ? 1 : 0);
+              }
+              fclose(fp);
+          }
+
+          static void applyGamePltHooks() {
+              xhook_enable_debug(0);
+              xhook_register("^/data/app/.*\\.so$", "clock_gettime",
+                             reinterpret_cast<void *>(hooked_clock_gettime), nullptr);
+              xhook_register("^/data/app/.*\\.so$", "gettimeofday",
+                             reinterpret_cast<void *>(hooked_gettimeofday), nullptr);
+              xhook_refresh(0);
+          }
+
+          static void workerLoop(std::string cfg_path) {
+              time_t last_mtime = 0;
+              readLiveConfig(cfg_path, last_mtime);
+
+              static const int kHookRefreshSec[] = {1, 2, 4, 7, 12, 20};
+              int elapsed_half_sec = 0;
+              size_t refresh_idx = 0;
+
+              applyGamePltHooks();
+
+              while (true) {
+                  usleep(500000);
+                  elapsed_half_sec++;
+
+                  if (refresh_idx < (sizeof(kHookRefreshSec) / sizeof(kHookRefreshSec[0]))) {
+                      if (elapsed_half_sec >= kHookRefreshSec[refresh_idx] * 2) {
+                          applyGamePltHooks();
+                          refresh_idx++;
+                      }
+                  }
+
+                  readLiveConfig(cfg_path, last_mtime);
+              }
+          }
+
+          static bool readAll(int fd, void *buf, size_t len) {
+              auto *p = static_cast<uint8_t *>(buf);
+              while (len > 0) {
+                  ssize_t n = read(fd, p, len);
+                  if (n <= 0) return false;
+                  p += n;
+                  len -= static_cast<size_t>(n);
+              }
+              return true;
+          }
+
+          static bool writeAll(int fd, const void *buf, size_t len) {
+              const auto *p = static_cast<const uint8_t *>(buf);
+              while (len > 0) {
+                  ssize_t n = write(fd, p, len);
+                  if (n <= 0) return false;
+                  p += n;
+                  len -= static_cast<size_t>(n);
+              }
+              return true;
+          }
+
+          static std::string trimLine(const char *s) {
+              std::string out(s);
+              while (!out.empty() && (out.back() == '\n' || out.back() == '\r' || out.back() == ' ' || out.back() == '\t')) {
+                  out.pop_back();
+              }
+              size_t start = 0;
+              while (start < out.size() && (out[start] == ' ' || out[start] == '\t')) {
+                  start++;
+              }
+              return out.substr(start);
+          }
+
+          static void companionHandler(int fd) {
+              uint32_t name_len = 0;
+              if (!readAll(fd, &name_len, sizeof(name_len)) || name_len == 0 || name_len > 256) {
+                  uint8_t res = 0;
+                  writeAll(fd, &res, 1);
+                  return;
+              }
+
+              std::string proc_name(name_len, '\0');
+              if (!readAll(fd, &proc_name[0], name_len)) {
+                  uint8_t res = 0;
+                  writeAll(fd, &res, 1);
+                  return;
+              }
+
+              uint8_t matched = 0;
+              FILE *fp = fopen(kTargetFile, "r");
+              if (fp) {
+                  char line[256];
+                  while (fgets(line, sizeof(line), fp) != nullptr) {
+                      std::string t = trimLine(line);
+                      if (t.empty() || t[0] == '#') continue;
+                      if (proc_name == t) {
+                          matched = 1;
+                          break;
+                      }
+                  }
+                  fclose(fp);
+              }
+
+              writeAll(fd, &matched, 1);
+          }
+
+          class AshveilSpeedModule : public zygisk::ModuleBase {
+          public:
+              void onLoad(zygisk::Api *api, JNIEnv *env) override {
+                  this->api_ = api;
+                  this->env_ = env;
+              }
+
+              void preAppSpecialize(zygisk::AppSpecializeArgs *args) override {
+                  if (!args || !args->nice_name) {
+                      api_->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
+                      return;
+                  }
+
+                  const char *raw_name = env_->GetStringUTFChars(args->nice_name, nullptr);
+                  std::string proc_name = raw_name ? raw_name : "";
+                  if (raw_name) env_->ReleaseStringUTFChars(args->nice_name, raw_name);
+
+                  if (args->app_data_dir) {
+                      const char *raw_dir = env_->GetStringUTFChars(args->app_data_dir, nullptr);
+                      if (raw_dir) {
+                          data_dir_ = raw_dir;
+                          env_->ReleaseStringUTFChars(args->app_data_dir, raw_dir);
+                      }
+                  }
+
+                  bool matched = false;
+                  int cfd = api_->connectCompanion();
+                  if (cfd >= 0) {
+                      uint32_t len = static_cast<uint32_t>(proc_name.size());
+                      uint8_t res = 0;
+                      if (writeAll(cfd, &len, sizeof(len)) &&
+                          writeAll(cfd, proc_name.data(), len) &&
+                          readAll(cfd, &res, 1)) {
+                          matched = (res == 1);
+                      }
+                      close(cfd);
+                  }
+
+                  if (matched) {
+                      is_target_ = true;
+                      api_->setOption(zygisk::Option::FORCE_DENYLIST_UNMOUNT);
+                  } else {
+                      api_->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
+                  }
+              }
+
+              void postAppSpecialize(const zygisk::AppSpecializeArgs *args) override {
+                  (void)args;
+                  if (!is_target_) return;
+
+                  bool expected = false;
+                  if (g_worker_started.compare_exchange_strong(expected, true)) {
+                      std::string cfg_path = data_dir_.empty()
+                          ? "/data/local/tmp/.ashev_spd"
+                          : (data_dir_ + "/cache/.spd_cfg");
+                      LOGI("Active in target process. Live config: %s", cfg_path.c_str());
+                      std::thread(workerLoop, cfg_path).detach();
+                  }
+              }
+
+              void preServerSpecialize(zygisk::ServerSpecializeArgs *args) override {
+                  (void)args;
+                  api_->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
+              }
+
+          private:
+              zygisk::Api *api_ = nullptr;
+              JNIEnv *env_ = nullptr;
+              bool is_target_ = false;
+              std::string data_dir_;
+          };
+
+          REGISTER_ZYGISK_MODULE(AshveilSpeedModule)
+          REGISTER_ZYGISK_COMPANION(companionHandler)
+          __END_MAIN_CPP__
+
+          cat << '__END_CMAKE__' > native/CMakeLists.txt
+          cmake_minimum_required(VERSION 3.18)
+          project(ashevill_speed LANGUAGES C CXX)
+
+          set(CMAKE_CXX_STANDARD 17)
+          set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+          set(XHOOK_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/xHook/libxhook/jni")
+
+          add_library(xhook_static STATIC
+              "${XHOOK_DIR}/xhook.c"
+              "${XHOOK_DIR}/xh_core.c"
+              "${XHOOK_DIR}/xh_elf.c"
+              "${XHOOK_DIR}/xh_log.c"
+              "${XHOOK_DIR}/xh_util.c"
+              "${XHOOK_DIR}/xh_version.c"
+          )
+          target_include_directories(xhook_static PUBLIC "${XHOOK_DIR}")
+          target_compile_options(xhook_static PRIVATE -O2 -fPIC -Wall -Wno-unused-parameter -Wno-sign-compare)
+
+          add_library(ashevill_speed SHARED
+              src/main.cpp
+          )
+          target_include_directories(ashevill_speed PRIVATE
+              "${CMAKE_CURRENT_SOURCE_DIR}/src"
+          )
+          target_compile_options(ashevill_speed PRIVATE
+              -O2 -fvisibility=hidden -fvisibility-inlines-hidden -fno-exceptions -fno-rtti
+          )
+          target_link_options(ashevill_speed PRIVATE
+              -Wl,--gc-sections -Wl,--exclude-libs,ALL
+          )
+          target_link_libraries(ashevill_speed PRIVATE
+              xhook_static
+              log
+          )
+          __END_CMAKE__
+
+          cat << '__END_MOD_PROP__' > module/module.prop
+          id=ashevill_speed
+          name=Ashveil Speed Engine (Zygisk Native)
+          version=v1.0
+          versionCode=100
+          author=AshveilSpeed Project
+          description=Standalone Native C++ Zygisk PLT Speed Engine (Zero Frida / Zero GameGuardian / Zero Accessibility)
+          __END_MOD_PROP__
+
+          cat << '__END_CUSTOMIZE__' > module/customize.sh
+          #!/system/bin/sh
+          ui_print "========================================"
+          ui_print "  Ashveil Speed Engine (Zygisk Native)  "
+          ui_print "========================================"
+
+          if [ ! -f "$MODPATH/target.txt" ]; then
+              printf '# Target game package name\n' > "$MODPATH/target.txt"
+          fi
+
+          set_perm_recursive "$MODPATH" 0 0 0755 0644
+          set_perm "$MODPATH/action.sh" 0 0 0755
+          ui_print "- Done! Reboot your device."
+          __END_CUSTOMIZE__
+
+          cat << '__END_ACTION__' > module/action.sh
+          #!/system/bin/sh
+          MODDIR="${0%/*}"
+          TARGET_FILE="$MODDIR/target.txt"
+          PKG=$(grep -v '^#' "$TARGET_FILE" 2>/dev/null | tr -d '\r ' | head -n 1)
+
+          if [ -z "$PKG" ]; then
+              echo "No target game set yet in target.txt"
+              exit 0
+          fi
+
+          CFG="/data/user/0/$PKG/cache/.spd_cfg"
+          CUR=$(awk '{print $1}' "$CFG" 2>/dev/null)
+          case "$CUR" in
+              "1.10") NEXT="1.20" ;;
+              "1.20") NEXT="1.35" ;;
+              "1.35") NEXT="1.50" ;;
+              "1.50") NEXT="1.00" ;;
+              *)      NEXT="1.10" ;;
+          esac
+
+          mkdir -p "/data/user/0/$PKG/cache"
+          echo "$NEXT 1" > "$CFG"
+          chmod 666 "$CFG"
+          echo "Game: $PKG | Speed: ${NEXT}x"
+          __END_ACTION__
+
+          cat << '__END_TARGET__' > module/target.txt
+          # Write Ashveil Online package name here (or pick it from AshevillSpeed_Controller.js)
+          __END_TARGET__
+
+      - name: Download official Zygisk API v4 header
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/topjohnwu/zygisk-module-sample/master/module/jni/zygisk.hpp \
+            -o native/src/zygisk.hpp
+
+      - name: Clone iqiyi/xHook
+        run: |
+          mkdir -p native/third_party
+          git clone --depth 1 https://github.com/iqiyi/xHook.git native/third_party/xHook
+
+      - name: Locate Android NDK
+        id: ndk
+        run: |
+          NDK_PATH="${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_HOME}}"
+          if [ -z "$NDK_PATH" ]; then
+            NDK_PATH=$(ls -d /usr/local/lib/android/sdk/ndk/* | sort -V | tail -n 1)
+          fi
+          echo "Using NDK: $NDK_PATH"
+          echo "path=$NDK_PATH" >> "$GITHUB_OUTPUT"
+
+      - name: Build ARM64 and ARMv7 Native Libraries
+        run: |
+          NDK="${{ steps.ndk.outputs.path }}"
+          for ABI in arm64-v8a armeabi-v7a; do
+            echo "=== Building $ABI ==="
+            cmake -S native -B "build/$ABI" \
+              -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
+              -DANDROID_ABI="$ABI" \
+              -DANDROID_PLATFORM=android-24 \
+              -DCMAKE_BUILD_TYPE=Release
+            cmake --build "build/$ABI" --parallel
+          done
+
+      - name: Package Flashable Magisk Module ZIP
+        run: |
+          mkdir -p out/zygisk
+          cp -r module/* out/
+          cp build/arm64-v8a/libashevill_speed.so out/zygisk/arm64-v8a.so
+          cp build/armeabi-v7a/libashevill_speed.so out/zygisk/armeabi-v7a.so
+          cd out
+          zip -r9 ../AshveilSpeed-Magisk.zip .
+
+      - name: Upload Magisk Module Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AshveilSpeed-Magisk
+          path: AshveilSpeed-Magisk.zip
+
+      - name: Publish Direct Download Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="v1.0-${GITHUB_RUN_NUMBER}"
+          gh release create "$TAG" AshveilSpeed-Magisk.zip \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "Ashveil Speed Magisk ($TAG)" \
+            --notes "Ready-to-flash Magisk module." || true
