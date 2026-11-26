@@ -360,6 +360,7 @@ jobs:
               "${XHOOK_DIR}/xh_version.c"
           )
           target_include_directories(xhook_static PUBLIC "${XHOOK_DIR}")
+          target_compile_definitions(xhook_static PRIVATE PAGE_SIZE=4096 "PAGE_MASK=(~(4096UL-1))")
           target_compile_options(xhook_static PRIVATE -O2 -fPIC -Wall -Wno-unused-parameter -Wno-sign-compare)
 
           add_library(ashevill_speed SHARED
